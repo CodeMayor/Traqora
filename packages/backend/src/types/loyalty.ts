@@ -35,6 +35,17 @@ export interface LoyaltyAccount {
   tierUpdatedAt: Date;
   createdAt: Date;
   updatedAt: Date;
+  referralCode?: string;
+  referralConversions?: string[];
+  referralStats?: ReferralStats;
+}
+
+export interface ReferralStats {
+  totalClicks: number;
+  totalConversions: number;
+  pendingPoints: number;
+  earnedPoints: number;
+  referees: string[];
 }
 
 export interface PointsTransaction {

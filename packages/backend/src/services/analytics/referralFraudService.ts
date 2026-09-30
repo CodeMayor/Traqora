@@ -24,6 +24,7 @@ export interface ReferralClickRecord {
 export interface ReferralConversionRecord {
   refereeId: string;
   convertedAt: Date;
+  ip?: string | null;
   bookingValueCents?: number;
 }
 
@@ -100,6 +101,11 @@ export function assessReferralFraud(signals: ReferralFraudSignals): ReferralFrau
   // One IP driving many distinct conversions (click farms, device farms).
   const ipOwners = new Map<string, Set<string>>();
   for (const conversion of signals.conversions) {
+    if (conversion.ip) {
+      const owners = ipOwners.get(conversion.ip) ?? new Set<string>();
+      owners.add(conversion.refereeId);
+      ipOwners.set(conversion.ip, owners);
+    }
     for (const click of signals.clicks) {
       if (click.refereeId === conversion.refereeId && click.ip) {
         const owners = ipOwners.get(click.ip) ?? new Set<string>();
@@ -117,7 +123,7 @@ export function assessReferralFraud(signals: ReferralFraudSignals): ReferralFrau
     if (owners.size >= IP_CLUSTER_THRESHOLD) {
       flags.add('ip_cluster');
       reasons.push(
-        `IP ${maskIp(ip)} is associated with ${owners.size} distinct referees (threshold ${IP_CLUSTER_THRESHOLD})`,
+        `IP ${maskReferralIp(ip)} is associated with ${owners.size} distinct referees (threshold ${IP_CLUSTER_THRESHOLD})`,
       );
       break;
     }
@@ -166,7 +172,7 @@ export function assessReferralFraud(signals: ReferralFraudSignals): ReferralFrau
 }
 
 /** Never log full client IPs; keep the last octet masked. */
-function maskIp(ip: string): string {
+export function maskReferralIp(ip: string): string {
   const parts = ip.split('.');
   if (parts.length === 4) return `${parts[0]}.${parts[1]}.${parts[2]}.x`;
   return 'masked';

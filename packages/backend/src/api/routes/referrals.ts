@@ -21,9 +21,15 @@ import { emailService } from '../../services/EmailService';
 import { BadRequestError } from '../../utils/errors';
 import {
   assessReferralFraud,
+  maskReferralIp,
   ReferralClickRecord,
   ReferralConversionRecord,
 } from '../../services/analytics/referralFraudService';
+import {
+  getReferralFraudHistory,
+  recordReferralClick,
+  recordReferralConversion,
+} from '../../services/analytics/referralFraudSignalStore';
 
 const router = Router();
 
@@ -46,6 +52,7 @@ const convertReferralSchema = z.object({
 
 const trackClickSchema = z.object({
   referralCode: z.string().min(6).max(32),
+  refereeId:    z.string().min(1).optional(),
   refereeIp:    z.string().optional(),
   userAgent:    z.string().optional(),
 });
@@ -56,26 +63,31 @@ const inviteSchema = z.object({
 });
 
 const INVITE_BASE_URL = process.env.APP_BASE_URL || 'https://traqora.com';
+const conversionQueues = new Map<string, Promise<void>>();
 
-/**
- * Fraud-signal logs (issue #540): per-code click and conversion history
- * used by assessReferralFraud. In-memory and capped; in production these
- * come from the analytics pipeline. Heuristics only FLAG — nothing here
- * blocks a referral.
- */
-const REFERRAL_LOG_CAP = 500;
-const referralClickLog = new Map<string, ReferralClickRecord[]>();
-const referralConversionLog = new Map<string, ReferralConversionRecord[]>();
+async function withReferralConversionLock<T>(
+  referralCode: string,
+  refereeId: string,
+  operation: () => Promise<T>,
+): Promise<T> {
+  const key = `${referralCode}\u0000${refereeId}`;
+  const previous = conversionQueues.get(key) ?? Promise.resolve();
+  let release = () => {};
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const queued = previous.then(() => current);
+  conversionQueues.set(key, queued);
 
-function appendLog<T>(map: Map<string, T[]>, code: string, entry: T): void {
-  const log = map.get(code) ?? [];
-  log.push(entry);
-  if (log.length > REFERRAL_LOG_CAP) log.shift();
-  map.set(code, log);
-}
-
-function logFor<T>(map: Map<string, T[]>, code: string): T[] {
-  return map.get(code) ?? [];
+  await previous;
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (conversionQueues.get(key) === queued) {
+      conversionQueues.delete(key);
+    }
+  }
 }
 
 function emptyStats(): ReferralStats {
@@ -204,8 +216,7 @@ router.get(
 /**
  * POST /referrals/track
  * Public — records a referral link click for attribution against the
- * referrer's dashboard stats. Self-referrals (referrer == referee IP) are
- * rejected rather than silently counted.
+ * referrer's dashboard stats. Suspicious activity is flagged, not blocked.
  */
 router.post(
   '/track',
@@ -216,14 +227,8 @@ router.post(
       return;
     }
 
-    const { referralCode, refereeIp, userAgent } = parsed.data;
+    const { referralCode, refereeId, refereeIp, userAgent } = parsed.data;
     const requesterIp = req.ip;
-
-    if (refereeIp && requesterIp && refereeIp === requesterIp) {
-      logger.warn('referral: self-referral attempt blocked', { referralCode, ip: requesterIp });
-      res.status(400).json({ error: 'Self-referrals are not permitted' });
-      return;
-    }
 
     const store   = LoyaltyStore.getInstance();
     const referrer = findAccountByReferralCode(store, referralCode);
@@ -233,23 +238,26 @@ router.post(
     }
 
     // Fraud heuristics (issue #540): flag, never block.
-    const clickIp = refereeIp ?? requesterIp ?? null;
-    appendLog(referralClickLog, referralCode, {
+    const clickIp = requesterIp ?? refereeIp ?? null;
+    const clickRecord: ReferralClickRecord = {
+      refereeId,
       ip: clickIp,
       userAgent: userAgent ?? null,
       clickedAt: new Date(),
-    });
+    };
+    await recordReferralClick(referralCode, clickRecord);
+    const history = await getReferralFraudHistory(referralCode);
     const fraud = assessReferralFraud({
       referrerId: referrer.userId,
-      refereeId: clickIp ?? 'anonymous-click',
+      refereeId: refereeId ?? 'anonymous-click',
       refereeIp: clickIp,
-      clicks: logFor(referralClickLog, referralCode),
-      conversions: logFor(referralConversionLog, referralCode),
+      clicks: history.clicks,
+      conversions: history.conversions,
     });
     if (fraud.recommendedAction === 'flag') {
       logger.warn('referral: suspicious click flagged by heuristics', {
         referralCode,
-        ip: clickIp,
+        ip: clickIp ? maskReferralIp(clickIp) : null,
         flags: fraud.flags,
         riskScore: fraud.riskScore,
         reasons: fraud.reasons,
@@ -261,7 +269,11 @@ router.post(
     referrer.referralStats = stats;
     store.updateAccount(referrer);
 
-    logger.info('referral: click tracked', { referralCode, refereeIp, userAgent });
+    logger.info('referral: click tracked', {
+      referralCode,
+      refereeIp: clickIp ? maskReferralIp(clickIp) : null,
+      userAgent,
+    });
     res.status(201).json({
       tracked: true,
       referralCode,
@@ -274,7 +286,7 @@ router.post(
  * POST /referrals/convert
  * Internal/webhook — converts a referral when the referee completes their first booking.
  * Awards BASE_REFERRAL_POINTS × tier multiplier to referrer; REFEREE_WELCOME_POINTS to referee.
- * Fraud guard: a referee can only convert once; self-referrals are rejected.
+ * Fraud guard: a referee can only convert once; suspicious activity is flagged.
  */
 router.post(
   '/convert',
@@ -287,79 +299,76 @@ router.post(
 
     const { referralCode, refereeId, bookingId } = parsed.data;
 
-    const store    = LoyaltyStore.getInstance();
-    const referrer = findAccountByReferralCode(store, referralCode);
+    await withReferralConversionLock(referralCode, refereeId, async () => {
+      const store    = LoyaltyStore.getInstance();
+      const referrer = findAccountByReferralCode(store, referralCode);
 
-    if (!referrer) {
-      res.status(404).json({ error: 'Referral code not found or expired' });
-      return;
-    }
+      if (!referrer) {
+        res.status(404).json({ error: 'Referral code not found or expired' });
+        return;
+      }
 
-    if (referrer.userId === refereeId) {
-      res.status(400).json({ error: 'Self-referral is not permitted' });
-      return;
-    }
+      const conversions = referrer.referralConversions ?? [];
+      if (conversions.includes(refereeId)) {
+        res.status(409).json({ error: 'Referee has already converted for this referral' });
+        return;
+      }
 
-    const conversions = referrer.referralConversions ?? [];
-    if (conversions.includes(refereeId)) {
-      res.status(409).json({ error: 'Referee has already converted for this referral' });
-      return;
-    }
-
-    // Fraud heuristics (issue #540): assess the conversion against click/IP
-    // history and prior conversions. Flagged referrals are still processed —
-    // the flags are logged for review and surfaced in the response.
-    const fraud = assessReferralFraud({
-      referrerId: referrer.userId,
-      refereeId,
-      refereeIp: req.ip ?? null,
-      clicks: logFor(referralClickLog, referralCode),
-      conversions: logFor(referralConversionLog, referralCode),
-    });
-    if (fraud.recommendedAction === 'flag') {
-      logger.warn('referral: conversion flagged by fraud heuristics', {
-        referralCode,
+      // Include the candidate conversion so thresholds apply on the exact event.
+      const history = await getReferralFraudHistory(referralCode);
+      const candidateConversion: ReferralConversionRecord = {
         refereeId,
-        flags: fraud.flags,
-        riskScore: fraud.riskScore,
-        reasons: fraud.reasons,
+        ip: req.ip ?? null,
+        convertedAt: new Date(),
+      };
+      const fraud = assessReferralFraud({
+        referrerId: referrer.userId,
+        refereeId,
+        refereeIp: req.ip ?? null,
+        clicks: history.clicks,
+        conversions: [...history.conversions, candidateConversion],
       });
-    }
-    appendLog(referralConversionLog, referralCode, {
-      refereeId,
-      convertedAt: new Date(),
-      bookingValueCents: undefined,
-    });
+      if (fraud.recommendedAction === 'flag') {
+        logger.warn('referral: conversion flagged by fraud heuristics', {
+          referralCode,
+          refereeId,
+          flags: fraud.flags,
+          riskScore: fraud.riskScore,
+          reasons: fraud.reasons,
+        });
+      }
 
-    const tier         = referrer.tier ?? 'bronze';
-    const multiplier   = TIER_MULTIPLIERS[tier] ?? 1;
-    const pointsEarned = Math.round(BASE_REFERRAL_POINTS * multiplier);
+      const tier         = referrer.tier ?? 'bronze';
+      const multiplier   = TIER_MULTIPLIERS[tier] ?? 1;
+      const pointsEarned = Math.round(BASE_REFERRAL_POINTS * multiplier);
 
-    conversions.push(refereeId);
-    referrer.referralConversions = conversions;
+      await recordReferralConversion(referralCode, candidateConversion);
+      conversions.push(refereeId);
+      referrer.referralConversions = conversions;
 
-    const stats = referrer.referralStats ?? emptyStats();
-    stats.totalConversions += 1;
-    stats.earnedPoints += pointsEarned;
-    stats.referees = [...new Set([...stats.referees, refereeId])];
-    referrer.referralStats = stats;
+      const stats = referrer.referralStats ?? emptyStats();
+      stats.totalConversions += 1;
+      stats.earnedPoints += pointsEarned;
+      stats.referees = [...new Set([...stats.referees, refereeId])];
+      referrer.referralStats = stats;
 
-    store.updateAccount(referrer);
-    store.getOrCreateAccount(refereeId);
+      store.updateAccount(referrer);
+      store.getOrCreateAccount(refereeId);
 
-    logger.info('referral: conversion processed', { referralCode, refereeId, bookingId, pointsEarned });
+      logger.info('referral: conversion processed', { referralCode, refereeId, bookingId, pointsEarned });
 
-    res.status(201).json({
-      referralCode,
-      referrerId:            referrer.userId,
-      refereeId,
-      bookingId,
-      referrerPointsAwarded: pointsEarned,
-      refereePointsAwarded:  REFEREE_WELCOME_POINTS,
-      tier,
-      multiplier,
-      processedAt: new Date().toISOString(),
-      ...(fraud.flags.length > 0 ? { fraud } : {}),
+      res.status(201).json({
+        referralCode,
+        referrerId:            referrer.userId,
+        refereeId,
+        bookingId,
+        referrerPointsAwarded: pointsEarned,
+        refereePointsAwarded:  REFEREE_WELCOME_POINTS,
+        tier,
+        multiplier,
+        processedAt: new Date().toISOString(),
+        ...(fraud.flags.length > 0 ? { fraud } : {}),
+      });
     });
   }),
 );
