@@ -73,11 +73,19 @@ export class PriceOracleService {
     this.initializeCache();
   }
 
-  public static getInstance(): PriceOracleService {
+    public static getInstance(): PriceOracleService {
     if (!PriceOracleService.instance) {
       PriceOracleService.instance = new PriceOracleService();
     }
     return PriceOracleService.instance;
+  }
+
+  /**
+   * Clear the singleton instance so `getInstance()` builds a fresh oracle with
+   * empty caches. Test-only; keeps unit tests isolated from one another.
+   */
+  public static resetForTesting(): void {
+    PriceOracleService.instance = undefined as unknown as PriceOracleService;
   }
 
   private initializeCache() {
@@ -299,9 +307,12 @@ export class PriceOracleService {
     let cached = this.priceCache.get(key);
     const stale = !cached || this.priceAgeMs(cached) >= PRICE_STALENESS_MS;
 
-    if (stale || force) {
+      if (stale || force) {
       const lastAttempt = cached?.lastRefreshAttemptAt ?? 0;
-      if (Date.now() - lastAttempt >= MIN_REFRESH_INTERVAL_MS) {
+      // An explicit `force` refresh bypasses the rate bound; the min-interval
+      // guard only throttles *stale-triggered* auto-refreshes so concurrent and
+      // back-to-back cache reads don't stampede the upstream.
+      if (force || Date.now() - lastAttempt >= MIN_REFRESH_INTERVAL_MS) {
         try {
           const fetched = await this.mockApiCall([flightId], targetCurrency);
           const fresh = fetched[0];
