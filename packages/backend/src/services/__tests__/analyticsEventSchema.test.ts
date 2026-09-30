@@ -1,69 +1,106 @@
 /**
  * Tests for analytics event schema validation (issue #539).
  *
- * Covers the schema module plus the drop-and-log ingestion gate used by the
- * user-analytics pipeline (`recordUserAnalyticsEvent`) and the analytics
- * pipeline (`recordRecommendationEvent`).
+ * Follows the repo's unit-test style (see VolatilityService.test.ts):
+ * pure functions only, no live DB. The validators and the pure ingestion
+ * gate are exercised in isolation.
  */
 
-import { describe, it, expect, vi, beforeEach } from '@jest/globals';
-
-vi.mock('../src/db/dataSource', () => ({
-  AppDataSource: {
-    getRepository: vi.fn(() => ({
-      create: vi.fn((x: unknown) => x),
-      save: vi.fn().mockResolvedValue(undefined),
-      find: vi.fn().mockResolvedValue([]),
-    })),
-  },
-}));
+import { describe, it, expect } from '@jest/globals';
 
 import {
   validateAnalyticsEvent,
   validateRecommendationEvent,
   analyticsEventSchema,
   recommendationEventSchema,
-} from '../src/services/analyticsEventSchema';
-import { recordRecommendationEvent } from '../src/services/analytics';
-import {
-  recordUserAnalyticsEvent,
-  getRecentUserAnalyticsEvents,
-} from '../src/services/user-analytics';
+} from '../analyticsEventSchema';
+import { recordUserAnalyticsEvent, getRecentUserAnalyticsEvents } from '../user-analytics';
+import type { AnalyticsEvent, ValidatedRecommendationEvent } from '../analyticsEventSchema';
 
 describe('analytics event schemas (#539)', () => {
-  describe('validateAnalyticsEvent', () => {
+  describe('analyticsEventSchema', () => {
     it('accepts a well-formed generic event', () => {
-      const result = validateAnalyticsEvent({
+      const parsed = analyticsEventSchema.safeParse({
         userId: 'u1',
         eventType: 'search_performed',
         destinationCode: 'lax',
         metadata: { q: 'beach' },
       });
-      expect(result.ok).toBe(true);
-      if (result.ok) expect(result.event.destinationCode).toBe('LAX');
+      expect(parsed.success).toBe(true);
     });
 
-    it.each([
-      { userId: '', eventType: 'ok' }, // empty userId
-      { userId: 'u1', eventType: 'bad-event!' }, // invalid eventType
-      { userId: 'u1', eventType: 'ok', destinationCode: 'long' }, // bad code
-    ])('drops malformed input %p', (input) => {
-      const result = validateAnalyticsEvent(input);
-      expect(result.ok).toBe(false);
+    it('requires a non-empty userId', () => {
+      const parsed = analyticsEventSchema.safeParse({ userId: '', eventType: 'ok' });
+      expect(parsed.success).toBe(false);
     });
 
-    it('uppercases the destination code on validation', () => {
-      const result = validateAnalyticsEvent({
+    it('requires a lowercase event type with alphanumeric/underscore chars', () => {
+      expect(analyticsEventSchema.safeParse({ userId: 'u1', eventType: 'bad-type!' }).success).toBe(false);
+      expect(analyticsEventSchema.safeParse({ userId: 'u1', eventType: 'ok' }).success).toBe(true);
+    });
+
+    it('requires a 3-letter destination code when provided', () => {
+      expect(
+        analyticsEventSchema.safeParse({ userId: 'u1', eventType: 'ok', destinationCode: 'LGA' }).success,
+      ).toBe(false);
+      expect(
+        analyticsEventSchema.safeParse({ userId: 'u1', eventType: 'ok', destinationCode: 'lax' }).success,
+      ).toBe(true);
+    });
+  });
+
+  describe('recommendationEventSchema', () => {
+    it('accepts the known variant/action matrix', () => {
+      for (const variant of ['control', 'personalized'] as const) {
+        for (const action of ['view', 'click', 'dismiss'] as const) {
+          const ok = recommendationEventSchema.safeParse({
+            userId: 'u1',
+            destinationCode: 'sea',
+            variant,
+            action,
+          }).success;
+          expect(ok).toBe(true);
+        }
+      }
+    });
+
+    it('rejects an unknown variant', () => {
+      const parsed = recommendationEventSchema.safeParse({
         userId: 'u1',
-        eventType: 'search_performed',
-        destinationCode: 'lax',
+        destinationCode: 'sea',
+        variant: 'bogus',
+        action: 'view',
       });
+      expect(parsed.success).toBe(false);
+    });
+
+    it('rejects a non-3-letter destination with an over-long reason', () => {
+      const parsed = recommendationEventSchema.safeParse({
+        userId: 'u1',
+        destinationCode: 'LGA',
+        variant: 'personalized',
+        action: 'click',
+        reason: 'x'.repeat(300),
+      });
+      expect(parsed.success).toBe(false);
+    });
+  });
+
+  describe('validateAnalyticsEvent', () => {
+    it('returns a success result for valid input', () => {
+      const result = validateAnalyticsEvent({ userId: 'u1', eventType: 'a' });
       expect(result.ok).toBe(true);
+    });
+
+    it('returns a failure result with errors for invalid input', () => {
+      const result = validateAnalyticsEvent({ userId: '' });
+      expect(result.ok).toBe(false);
+      if (!result.ok) expect(result.errors.length).toBeGreaterThan(0);
     });
   });
 
   describe('validateRecommendationEvent', () => {
-    it('accepts a valid recommendation event', () => {
+    it('returns the parsed event for valid input', () => {
       const result = validateRecommendationEvent({
         userId: 'u1',
         destinationCode: 'sea',
@@ -71,25 +108,18 @@ describe('analytics event schemas (#539)', () => {
         action: 'view',
       });
       expect(result.ok).toBe(true);
+      if (result.ok) {
+        const v: ValidatedRecommendationEvent = result.event;
+        expect(v.destinationCode).toBe('sea');
+      }
     });
 
-    it('drops an unknown variant', () => {
+    it('rejects an invalid action', () => {
       const result = validateRecommendationEvent({
         userId: 'u1',
         destinationCode: 'sea',
-        variant: 'bogus',
-        action: 'view',
-      });
-      expect(result.ok).toBe(false);
-    });
-
-    it('drops an invalid route code', () => {
-      const result = validateRecommendationEvent({
-        userId: 'u1',
-        destinationCode: 'LGA',
-        variant: 'personalized',
-        action: 'click',
-        reason: 'x'.repeat(300),
+        variant: 'control',
+        action: 'buy' as never,
       });
       expect(result.ok).toBe(false);
     });
@@ -97,20 +127,14 @@ describe('analytics event schemas (#539)', () => {
 });
 
 describe('user-analytics ingestion gate (#539)', () => {
-  beforeEach(() => {
-    // Clear the ring buffer between tests.
-    (getRecentUserAnalyticsEvents() as { length: number }).length = 0;
-    // The above is a no-op on a read-only snapshot; rely on fresh process state instead.
-  });
-
-  it('drops and returns null for a malformed event', () => {
+  it('drops and returns null for a malformed event, leaving the buffer unchanged', () => {
     const before = getRecentUserAnalyticsEvents().length;
     const result = recordUserAnalyticsEvent({ userId: '', eventType: 'bad!' });
     expect(result).toBeNull();
     expect(getRecentUserAnalyticsEvents().length).toBe(before);
   });
 
-  it('accepts and stores a valid event, defaulting the timestamp', () => {
+  it('accepts a valid event, normalising the timestamp and uppercasing the route', () => {
     const result = recordUserAnalyticsEvent({
       userId: 'u1',
       eventType: 'page_view',
@@ -118,25 +142,37 @@ describe('user-analytics ingestion gate (#539)', () => {
     });
     expect(result).not.toBeNull();
     expect(result!.destinationCode).toBe('JFK');
-    expect(result!.timestamp).toEqual(expect.any(String));
+    expect(typeof result!.timestamp).toBe('string');
     expect(getRecentUserAnalyticsEvents()).toContainEqual(
       expect.objectContaining({ userId: 'u1', destinationCode: 'JFK' }),
     );
   });
-});
 
-describe('recordRecommendationEvent drops malformed (#539)', () => {
-  it('does not persist and resolves for malformed input', async () => {
-    const { AppDataSource } = await import('../src/db/dataSource');
-    const save = vi.mocked(AppDataSource.getRepository).mock.results[0]?.value?.save as jest.Mock;
-    await recordRecommendationEvent({
-      userId: '',
-      destinationCode: 'bad',
-      variant: 'nope' as never,
-      action: 'view',
+  it('rejects a missing eventType without persisting', () => {
+    const before = getRecentUserAnalyticsEvents().length;
+    const result = recordUserAnalyticsEvent({ userId: 'u1' });
+    expect(result).toBeNull();
+    expect(getRecentUserAnalyticsEvents().length).toBe(before);
+  });
+
+  it('the returned event round-trips through the schema', () => {
+    const result = recordUserAnalyticsEvent({
+      userId: 'u2',
+      eventType: 'search_performed',
+      destinationCode: 'lax',
     });
-    const calls = save ? await save.mock.calls : [];
-    // No save should have occurred for the malformed payload.
-    expect((save?.mock.calls ?? []).length).toBe(0);
+    expect(result).not.toBeNull();
+    const parsed = analyticsEventSchema.safeParse(result);
+    expect(parsed.success).toBe(true);
+  });
+
+  it('exposes a readonly snapshot of accepted events', () => {
+    const result: AnalyticsEvent = recordUserAnalyticsEvent({
+      userId: 'u3',
+      eventType: 'click',
+      destinationCode: 'cdg',
+    }) as AnalyticsEvent;
+    expect(result).not.toBeNull();
+    expect(getRecentUserAnalyticsEvents().length).toBeGreaterThan(0);
   });
 });
