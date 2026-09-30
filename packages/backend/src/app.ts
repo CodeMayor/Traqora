@@ -16,6 +16,7 @@ import { adminBookingRoutes } from './api/routes/admin/bookings';
 import { adminAnalyticsRoutes } from './api/routes/admin/analytics';
 import { adminRefundRoutes } from './api/routes/admin/refunds';
 import { authRoutes } from './api/routes/auth';
+import { referralRoutes } from './api/routes/referrals';
 // @ts-ignore
 import swaggerUi from 'swagger-ui-express';
 import { openApiDocument } from './api/openapi/generator';
@@ -26,7 +27,7 @@ import {
   createDefaultFlightSearchService,
   FlightSearchService,
 } from './services/flightSearchService';
-import { errorHandler } from './utils/errorHandler';
+import { asyncHandler, errorHandler } from './utils/errorHandler';
 import { logger } from './utils/logger';
 import { requestLogger } from './middleware/requestLogger';
 import { metricsMiddleware } from './middleware/metricsMiddleware';
@@ -171,6 +172,7 @@ export const createApp = (options: AppOptions = {}) => {
   app.use('/api/v1/bookings', requireAuth, validateRequest('/api/v1/bookings'), bookingRoutes);
   app.use('/api/v1/refunds', requireAuth, validateRequest('/api/v1/refunds/request'), refundRoutes);
   app.use('/api/v1/security', requireAuth, securityRoutes);
+  app.use('/api/v1/referrals', referralRoutes);
 
   // Admin routes
   app.use('/api/v1/admin/auth', adminAuthRoutes);
